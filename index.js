@@ -1,15 +1,18 @@
 const express = require('express');
 const cors = require("cors");
+
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
-
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5000;
+
+
 
 // Middleware
 app.use(cors());
 app.use(express.json());
- 
+
 // MongoDB URI
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.s6ixckq.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -27,7 +30,9 @@ async function run() {
     await client.connect();
     console.log("MongoDB connected successfully");
 
-    const parcelCollection = client.db("parcelDB").collection("parcels");
+    const db = client.db("parcelDB");
+    const parcelCollection = db.collection("parcels");
+    const paymentCollection = db.collection("payments");
 
     // ---------------- POST API: Add new parcel ----------------
     app.post("/parcels", async (req, res) => {
@@ -53,39 +58,133 @@ async function run() {
       }
     });
 
-    // ---------------- GET API: Fetch all parcels ----------------
-    app.get("/parcels", async (req, res) => {
-  const email = req.query.email;
+    // --------------------------- Create Payment Intent-----------------------
+    app.post("/create-payment-intent", async (req, res) => {
+      try {
+        const { amountInCent } = req.body;
 
-  if (!email) {
-    return res.status(400).send({ success: false, message: "Email is required" });
-  }
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amountInCent,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
 
-  try {
-    // Fetch and sort parcels by latest creation_date
-    const parcels = await parcelCollection
-      .find({ user_email: email })
-      .sort({ creation_date: -1 }) // 🧠 This only works if stored as Date type
-      .toArray();
-
-    // If your creation_date is string (like now), do manual sort
-    const sortedParcels = parcels.sort(
-      (a, b) => new Date(b.creation_date) - new Date(a.creation_date)
-    );
-
-    res.send({
-      success: true,
-      count: sortedParcels.length,
-      parcels: sortedParcels,
+        res.send({
+          clientSecret: paymentIntent.client_secret,
+        });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
     });
+
+    // ---------------------- SAVE PAYMENT INFO ------------------------
+    app.post("/payments", async (req, res) => {
+      try {
+        const { email, transactionId, amount, parcelId, paymentMethod } = req.body;
+
+        if (!email || !transactionId || !amount) {
+          return res.status(400).send({ success: false, message: "Missing payment fields" });
+        }
+
+        // ----------------------- Save payment in payments collection---------------------
+        const paymentData = {
+          email,
+          parcelId,
+          amount,
+          transactionId,
+          paymentMethod,
+          payment_status: "paid", // mark as paid
+          date: new Date()
+        };
+        const paymentResult = await paymentCollection.insertOne(paymentData);
+
+        // ------------- Update the parcel's payment_status----------------
+        const parcelResult = await parcelCollection.updateOne(
+          { _id: new ObjectId(parcelId) },
+          { $set: { payment_status: "paid" } }  // update status
+        );
+
+        res.send({
+          success: true,
+          message: "Payment saved and parcel updated successfully",
+          paymentId: paymentResult.insertedId,
+          parcelModifiedCount: parcelResult.modifiedCount
+        });
+
+      } catch (error) {
+        console.error("Failed to save payment or update parcel:", error);
+        res.status(500).send({ success: false, message: "Failed to process payment" });
+      }
+    });
+
+    // ---------------------- GET USER PAYMENT HISTORY ------------------------
+    app.get("/payments", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).send({ success: false, message: "Email is required in query!" });
+
+        const payments = await paymentCollection.find({ email }).sort({ date: -1 }).toArray();
+
+        res.send(payments);
+      } catch (error) {
+        console.error("Failed to get payments:", error);
+        res.status(500).send({ success: false, message: "Failed to fetch payments" });
+      }
+    });
+
+
+    // ------------------ GET API: Fetch all parcels ------------------
+    app.get("/parcels", async (req, res) => {
+      const email = req.query.email;
+
+      if (!email) {
+        return res.status(400).send({ success: false, message: "Email is required" });
+      }
+
+      try {
+        // Fetch and sort parcels by latest creation_date
+        const parcels = await parcelCollection
+          .find({ user_email: email })
+          .sort({ creation_date: -1 }) // 🧠 This only works if stored as Date type
+          .toArray();
+
+        // If your creation_date is string (like now), do manual sort
+        const sortedParcels = parcels.sort(
+          (a, b) => new Date(b.creation_date) - new Date(a.creation_date)
+        );
+
+        res.send({
+          success: true,
+          count: sortedParcels.length,
+          parcels: sortedParcels,
+        });
 
       } catch (error) {
         console.error("Failed to fetch parcels:", error);
         res.status(500).send({ success: false, message: "Failed to fetch parcels" });
       }
     });
+    // ---------------- GET API: Fetch a single parcel by ID ----------------
+    app.get("/parcels/:id", async (req, res) => {
+      const id = req.params.id;
+      if (!id) {
+        return res.status(400).send({ success: false, message: "Parcel ID is required" });
+      }
+      try {
+        const parcel = await parcelCollection.findOne({ _id: new ObjectId(id) });
+        if (!parcel) {
+          return res.status(404).send({ success: false, message: "Parcel not found" });
+        }
+        res.send(parcel);
+      } catch (error) {
+        console.error("Failed to fetch parcel:", error);
+        res.status(500).send({ success: false, message: "Failed to fetch parcel" });
+      }
+    });
 
-      // ---------------- DELETE API: Delete a parcel ----------------
+
+
+    // ---------------- DELETE API: Delete a parcel ----------------
     app.delete("/parcels/:id", async (req, res) => {
       const id = req.params.id;
 
